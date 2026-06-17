@@ -24,7 +24,12 @@ done
 config="$DATABANK_CONFIG/github.yaml"
 [ -f "$config" ] || { echo "sweep: missing $config" >&2; exit 2; }
 
-mapfile -t repos < <(yq -r '.repos[]' "$config")
+# Read configured repos. Plain read loop (not mapfile) so this works on the
+# bash 3.2 that ships with macOS.
+repos=()
+while IFS= read -r line; do
+  [ -n "$line" ] && repos+=("$line")
+done < <(yq -r '.repos[]' "$config")
 [ "${#repos[@]}" -gt 0 ] || { log "sweep: no repos configured in $config"; exit 0; }
 
 n_ok=0 n_fail=0
