@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# databank — dispatcher for the databank CLI. See README.md / BRIEF.md.
+#
+# Everything is auto-discovered from the filesystem, so adding a source or an
+# analyzer needs ZERO edits here:
+#   fetch  <source> <sub>  → exec bin/sources/<source>/fetch-<sub>
+#   get    <source> <sub>  → exec bin/sources/<source>/get-<sub>
+#   sweep  <source>        → exec bin/sources/<source>/sweep
+#   analyze <name> ...     → exec bin/analyzers/<name>
+#   list   <source>        → enumerate entity dirs under data/<source>/
+#   status                 → read state/manifest.json
+set -euo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _link="$(readlink "$_src")"
+  case "$_link" in
+    /*) _src="$_link" ;;
+    *)  _src="$(cd "$(dirname "$_src")" && pwd)/$_link" ;;
+  esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
+export DATABANK_ROOT="$(dirname "$SCRIPT_DIR")"
+. "$SCRIPT_DIR/lib/common.sh"
+. "$DATABANK_LIB/manifest.sh"
+. "$DATABANK_LIB/duration.sh"
+
+SOURCES_DIR="$SCRIPT_DIR/sources"
+ANALYZERS_DIR="$SCRIPT_DIR/analyzers"
+
+# ---- auto-discovery helpers -------------------------------------------------
+
+list_sources() {
+  [ -d "$SOURCES_DIR" ] || return 0
+  for d in "$SOURCES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done | sort
+}
+
+sources_csv() { list_sources | tr '\n' ' ' | sed 's/ $//'; }
+
+is_source() {
+  local s="$1" x
+  while IFS= read -r x; do [ "$x" = "$s" ] && return 0; done < <(list_sources)
+  return 1
+}
+
+require_source() {
+  if ! is_source "$1"; then
+    echo "unknown source: $1 (valid: $(sources_csv))" >&2
+    exit 2
+  fi
+}
+
+# list_subs <source> <prefix>  →  one subcommand name per line (prefix stripped).
+list_subs() {
+  local d="$SOURCES_DIR/$1" prefix="$2" f
+  [ -d "$d" ] || return 0
+  for f in "$d/$prefix-"*; do
+    [ -x "$f" ] || continue
+    basename "$f" | sed "s/^$prefix-//"
+  done | sort
+}
+
+list_analyzers() {
+  [ -d "$ANALYZERS_DIR" ] || return 0
+  for f in "$ANALYZERS_DIR"/*; do
+    [ -x "$f" ] || continue
+    basename "$f"
+  done | sort
+}
+
+# ---- usage ------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+databank — local data-acquisition layer.
+
+  databank fetch   <source> <subcommand> ...    (run 'databank fetch'   for the list)
+  databank get     <source> <subcommand> ...    (run 'databank get'     for the list)
+  databank sweep   <source> [flags]             refresh all configured entities for a source
+  databank analyze <analyzer> ...               (run 'databank analyze' for the list)
+  databank list    <source>                     enumerate fetched entities
+  databank status                               freshness manifest
+
+Sources: $(sources_csv)
+
+Run any verb with --help (or no args) for details.
+Exit codes: 0 success · 1 data error · 2 usage error.
+EOF
+}
+
+# ---- fetch ------------------------------------------------------------------
+
+cmd_fetch_usage() {
+  cat <<EOF
+databank fetch — pull data from a source into local storage.
+
+  databank fetch <source> <subcommand> [flags]
+
+Sources / subcommands:
+EOF
+  local s subs
+  for s in $(list_sources); do
+    subs=$(list_subs "$s" fetch | tr '\n' ' ')
+    printf '  %-16s %s\n' "$s" "${subs:-(none)}"
+  done
+  echo
+  echo "Run 'databank fetch <source> <subcommand> --help' for subcommand flags."
+}
+
+cmd_fetch() {
+  if [ $# -eq 0 ]; then cmd_fetch_usage; exit 2; fi
+  case "$1" in -h|--help|help) cmd_fetch_usage; exit 0 ;; esac
+  local source="$1"; shift
+  require_source "$source"
+  if [ $# -eq 0 ] || { case "$1" in -h|--help|help) true ;; *) false ;; esac; }; then
+    echo "usage: fetch $source <subcommand> [flags]" >&2
+    echo "  subcommands: $(list_subs "$source" fetch | tr '\n' ' ')" >&2
+    [ $# -eq 0 ] && exit 2 || exit 0
+  fi
+  local sub="$1"; shift
+  local script="$SOURCES_DIR/$source/fetch-$sub"
+  if [ ! -x "$script" ]; then
+    echo "unknown subcommand: fetch $source $sub" >&2
+    echo "  available: $(list_subs "$source" fetch | tr '\n' ' ')" >&2
+    exit 2
+  fi
+  exec "$script" "$@"
+}
+
+# ---- get --------------------------------------------------------------------
+
+cmd_get_usage() {
+  cat <<EOF
+databank get — read fetched data back out as JSON / text.
+
+  databank get <source> <subcommand> [flags]
+
+Sources / subcommands:
+EOF
+  local s subs
+  for s in $(list_sources); do
+    subs=$(list_subs "$s" get | tr '\n' ' ')
+    printf '  %-16s %s\n' "$s" "${subs:-(none)}"
+  done
+  echo
+  echo "Run 'databank get <source> <subcommand> --help' for subcommand flags."
+}
+
+cmd_get() {
+  if [ $# -eq 0 ]; then cmd_get_usage; exit 2; fi
+  case "$1" in -h|--help|help) cmd_get_usage; exit 0 ;; esac
+  local source="$1"; shift
+  require_source "$source"
+  if [ $# -eq 0 ] || { case "$1" in -h|--help|help) true ;; *) false ;; esac; }; then
+    echo "usage: get $source <subcommand> [flags]" >&2
+    echo "  subcommands: $(list_subs "$source" get | tr '\n' ' ')" >&2
+    [ $# -eq 0 ] && exit 2 || exit 0
+  fi
+  local sub="$1"; shift
+  local script="$SOURCES_DIR/$source/get-$sub"
+  if [ ! -x "$script" ]; then
+    echo "unknown query: get $source $sub" >&2
+    echo "  available: $(list_subs "$source" get | tr '\n' ' ')" >&2
+    exit 2
+  fi
+  exec "$script" "$@"
+}
+
+# ---- sweep ------------------------------------------------------------------
+
+cmd_sweep_usage() {
+  cat <<EOF
+databank sweep — fetch all configured entities for a source.
+
+  databank sweep <source> [flags]
+
+Sources: $(sources_csv)
+
+Run 'databank sweep <source> --help' for per-source flags.
+EOF
+}
+
+cmd_sweep() {
+  if [ $# -eq 0 ]; then cmd_sweep_usage; exit 2; fi
+  case "$1" in -h|--help|help) cmd_sweep_usage; exit 0 ;; esac
+  local source="$1"; shift
+  require_source "$source"
+  local script="$SOURCES_DIR/$source/sweep"
+  if [ ! -x "$script" ]; then
+    echo "sweep $source: no executable sweep script at $script" >&2
+    exit 2
+  fi
+  exec "$script" "$@"
+}
+
+# ---- analyze ----------------------------------------------------------------
+
+cmd_analyze_usage() {
+  cat <<EOF
+databank analyze — derived analytics over databank data.
+
+  databank analyze <analyzer> [flags]
+
+Analyzers:
+EOF
+  local f
+  for f in $(list_analyzers); do printf '  %s\n' "$f"; done
+  echo
+  echo "Run 'databank analyze <analyzer> --help' for analyzer-specific flags."
+}
+
+cmd_analyze() {
+  if [ $# -eq 0 ]; then cmd_analyze_usage; exit 2; fi
+  case "$1" in -h|--help|help) cmd_analyze_usage; exit 0 ;; esac
+  local sub="$1"; shift
+  local script="$ANALYZERS_DIR/$sub"
+  if [ ! -x "$script" ]; then
+    echo "unknown analyzer: $sub" >&2
+    cmd_analyze_usage >&2
+    exit 2
+  fi
+  exec "$script" "$@"
+}
+
+# ---- list -------------------------------------------------------------------
+
+cmd_list_usage() {
+  cat <<EOF
+databank list — enumerate fetched entities for a source.
+
+  databank list <source>
+
+Lists the immediate entity directories under data/<source>/, one per line,
+sorted. Suitable for piping.
+EOF
+}
+
+cmd_list() {
+  if [ $# -eq 0 ]; then cmd_list_usage; exit 2; fi
+  case "$1" in -h|--help|help) cmd_list_usage; exit 0 ;; esac
+  local source="$1"; shift
+  require_source "$source"
+  if [ $# -gt 0 ]; then echo "list takes no flags; got: $*" >&2; exit 2; fi
+  local dir="$DATABANK_DATA/$source"
+  [ -d "$dir" ] || return 0
+  for d in "$dir"/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done | sort
+}
+
+# ---- status -----------------------------------------------------------------
+
+cmd_status_usage() {
+  cat <<EOF
+databank status — show freshness of fetched data from the manifest.
+
+  databank status [flags]
+
+Default: per-source summary (counts of ok/stale/error/empty) plus a capped
+list of issues. Source = the first path segment of each manifest key.
+
+Flags:
+  --detail        Print the full per-key table (every manifest row).
+  --source <s>    Filter to one source.
+  --stale [Nd]    Set the staleness threshold (default 7d); in --detail, show only stale rows.
+  --errors        In --detail, show only rows whose status is not "ok".
+  --json          Output JSON instead of formatted text.
+EOF
+}
+
+cmd_status() {
+  local detail=0 errors_only=0 stale_only=0 stale_days=7 json=0 source_filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help|help) cmd_status_usage; exit 0 ;;
+      --detail) detail=1 ;;
+      --errors) errors_only=1 ;;
+      --stale)
+        stale_only=1
+        if [ $# -gt 1 ] && [[ "${2:-}" =~ ^[0-9]+d$ ]]; then shift; stale_days="${1%d}"; fi
+        ;;
+      --source) shift; source_filter="${1:?--source requires value}" ;;
+      --json) json=1 ;;
+      *) echo "unknown flag: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  local p="$DATABANK_STATE/manifest.json"
+  if [ ! -f "$p" ]; then
+    if [ "$json" = "1" ]; then echo '{}'; else echo "(no manifest yet — nothing fetched)"; fi
+    return 0
+  fi
+
+  local stale_cutoff=$(( $(date -u +%s) - stale_days*86400 ))
+
+  if [ "$detail" = "1" ]; then
+    local filter_jq='
+      def parse_ts: if . == null or . == "" then 0 else (fromdateiso8601? // 0) end;
+      to_entries
+      | map(. + {ts: (.value.last_fetched | parse_ts), source: (.key | split("/")[0])})
+      | map(select($source_filter == "" or .source == $source_filter))
+      | map(select(($errors_only | not) or (.value.status // "") != "ok"))
+      | map(select(($stale_only  | not) or .ts < $stale_cutoff))
+      | sort_by(.key)
+    '
+    if [ "$json" = "1" ]; then
+      jq --argjson stale_cutoff "$stale_cutoff" \
+         --argjson errors_only "$([ "$errors_only" = 1 ] && echo true || echo false)" \
+         --argjson stale_only  "$([ "$stale_only"   = 1 ] && echo true || echo false)" \
+         --arg source_filter "$source_filter" \
+         "$filter_jq"' | map({key, last_fetched: .value.last_fetched, status: .value.status, error: .value.error})' "$p"
+      return 0
+    fi
+    jq -r --argjson stale_cutoff "$stale_cutoff" \
+       --argjson errors_only "$([ "$errors_only" = 1 ] && echo true || echo false)" \
+       --argjson stale_only  "$([ "$stale_only"   = 1 ] && echo true || echo false)" \
+       --arg source_filter "$source_filter" \
+       "$filter_jq"' | .[] | [.key, (.value.last_fetched // "-"), (.value.status // "-"), (.value.error // "")] | @tsv' "$p" \
+      | awk -F'\t' 'BEGIN{
+          printf "%-46s  %-22s  %-6s  %s\n","KEY","LAST_FETCHED","STATUS","ERROR"
+          printf "%-46s  %-22s  %-6s  %s\n","---","---","---","---" }
+        { printf "%-46s  %-22s  %-6s  %s\n",$1,$2,$3,$4 }'
+    return 0
+  fi
+
+  local summary
+  summary=$(jq --argjson stale_cutoff "$stale_cutoff" --arg source_filter "$source_filter" '
+    def parse_ts: if . == null or . == "" then 0 else (fromdateiso8601? // 0) end;
+    [ to_entries[]
+      | { key, value,
+          source: (.key | split("/")[0]),
+          ts:     (.value.last_fetched | parse_ts),
+          status: (.value.status // "unknown"),
+          error:  (.value.error  // "") }
+      | select($source_filter == "" or .source == $source_filter)
+    ] as $rows |
+    {
+      total: ($rows | length),
+      summary: ($rows | group_by(.source) | map({
+        source: .[0].source,
+        entries: length,
+        ok:     ([.[] | select(.status=="ok")] | length),
+        stale:  ([.[] | select(.status=="ok" and .ts < $stale_cutoff)] | length),
+        error:  ([.[] | select(.status=="error")] | length),
+        empty:  ([.[] | select(.status=="empty")] | length),
+        last:   ([.[].ts] | max | if (. // 0) == 0 then "-" else (. | todate) end)
+      })),
+      issues: ($rows
+        | map(select(.status == "error" or .status == "empty" or (.status == "ok" and .ts < $stale_cutoff)))
+        | map({key, status: (if .status=="ok" then "stale" else .status end),
+               last_fetched: .value.last_fetched, error}))
+    }' "$p")
+
+  if [ "$json" = "1" ]; then printf '%s\n' "$summary"; return 0; fi
+
+  echo "databank status — manifest at $p"
+  printf '%s\n' "$summary" | jq -r '"  total entries: \(.total)   stale threshold: '"$stale_days"'d"'
+  echo
+  printf '%s\n' "$summary" | jq -r '
+    .summary
+    | (["source","entries","last","ok","stale","error","empty"]),
+      (["---","---","---","---","---","---","---"]),
+      (.[] | [.source, .entries, .last, .ok, .stale, .error, .empty])
+    | @tsv' \
+    | awk -F'\t' '{ printf "  %-16s  %-7s  %-22s  %-4s  %-6s  %-6s  %-5s\n",$1,$2,$3,$4,$5,$6,$7 }'
+  echo
+  printf '%s\n' "$summary" | jq -r '
+    .issues as $i |
+    if ($i | length) == 0 then "No issues."
+    else
+      "Issues (\($i | length)):",
+      ($i | sort_by(.status, .key) | .[0:20][]
+        | (.error // "") as $e
+        | (if ($e | length) > 120 then ($e[0:117] + "...") else $e end) as $e
+        | "  \(.key)  [\(.status)]  last_fetched=\(.last_fetched // "-")\(if $e != "" then "  — \($e)" else "" end)"),
+      (if ($i | length) > 20 then "  … and \(($i | length) - 20) more (use --detail --errors)" else empty end)
+    end'
+}
+
+# ---- dispatch ---------------------------------------------------------------
+
+verb="${1:-}"
+[ -n "$verb" ] || { usage; exit 2; }
+shift || true
+case "$verb" in
+  fetch)   cmd_fetch   "$@" ;;
+  get)     cmd_get     "$@" ;;
+  sweep)   cmd_sweep   "$@" ;;
+  analyze) cmd_analyze "$@" ;;
+  list)    cmd_list    "$@" ;;
+  status)  cmd_status  "$@" ;;
+  -h|--help|help) usage ;;
+  *) echo "unknown verb: $verb" >&2; usage >&2; exit 2 ;;
+esac

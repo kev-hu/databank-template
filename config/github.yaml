@@ -1,0 +1,11 @@
+# github — declarative config for the example source.
+# `databank sweep github` fetches every repo listed here whose data is
+# older than `defaults.max_age`. Edit freely; this is the example source you'll
+# replace with your own once you've built it (see BRIEF.md).
+
+defaults:
+  max_age: 6h          # skip re-fetch if the repo was fetched more recently
+
+repos:
+  - facebook/react
+  - cli/cli

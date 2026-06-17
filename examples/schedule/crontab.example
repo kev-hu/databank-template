@@ -1,0 +1,5 @@
+# Run the github sweep every 6 hours. Edit paths to your checkout.
+# Install with:  crontab -e   (then paste, adjusting /path/to/databank)
+#
+# minute hour dom mon dow  command
+0 */6 * * * cd /path/to/databank && GITHUB_TOKEN=ghp_xxx ./bin/databank sweep github >> logs/sweep.log 2>&1

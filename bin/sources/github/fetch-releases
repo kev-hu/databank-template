@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# fetch-releases <owner/repo> [--max-age 6h] [--force] [--dry-run]
+#
+# Reference scraper. Pulls a repo's GitHub releases into a canonical file.
+# Demonstrates every databank invariant in ~one screen:
+#   - conditional GET via ETag (304 → no cost, keep old file)
+#   - never overwrite a non-empty canonical file with an empty result
+#   - cumulative upsert by stable primary key (release id)
+#   - atomic writes; raw payload cached for the latest run
+#   - manifest updated on success AND failure
+#
+# Auth is OPTIONAL: set GITHUB_TOKEN to lift the 60 req/hr unauthenticated cap.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../../lib/common.sh"
+. "$DATABANK_LIB/manifest.sh"
+. "$DATABANK_LIB/duration.sh"
+
+USAGE="usage: fetch-releases <owner/repo> [--max-age 6h] [--force] [--dry-run]"
+help_guard "$USAGE" "$@"
+
+repo="" max_age_override="" force="" dry_run=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --max-age) shift; max_age_override="${1:?--max-age requires a value}" ;;
+    --force)   force=1 ;;
+    --dry-run) dry_run=1 ;;
+    --*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *) repo="$1" ;;
+  esac
+  shift
+done
+[ -n "$repo" ] || { echo "$USAGE" >&2; exit 2; }
+case "$repo" in */*) ;; *) echo "fetch-releases: repo must be owner/repo, got '$repo'" >&2; exit 2 ;; esac
+
+# owner/repo → owner__repo for an on-disk entity id (no slashes in a dir name).
+slug="${repo//\//__}"
+key="github/$slug"
+
+config="$DATABANK_CONFIG/github.yaml"
+if [ -n "$max_age_override" ]; then
+  max_age="$max_age_override"
+elif [ -f "$config" ]; then
+  max_age=$(yq -r '.defaults.max_age // "6h"' "$config")
+else
+  max_age="6h"
+fi
+
+# Freshness gate: skip the network entirely if still fresh (unless --force).
+if [ -z "$force" ]; then
+  last=$(manifest_get_field "$key" last_fetched)
+  if is_fresh "$last" "$max_age"; then
+    log "fetch-releases: $repo is fresh (last=$last, max_age=$max_age) — skipping"
+    exit 0
+  fi
+fi
+
+data_dir="$DATABANK_DATA/github/$slug"
+cache_dir="$DATABANK_STATE/cache/github/$slug"
+releases_path="$data_dir/releases.json"
+api="https://api.github.com/repos/$repo/releases?per_page=100"
+
+if [ -n "$dry_run" ]; then
+  printf 'repo=%s\nslug=%s\nmax_age=%s\nurl=%s\nauth=%s\n' \
+    "$repo" "$slug" "$max_age" "$api" "$([ -n "${GITHUB_TOKEN:-}" ] && echo token || echo none)"
+  exit 0
+fi
+
+# Only the cache dir is needed up front (curl writes the raw payload here).
+# The data dir is created by atomic_write when — and only when — we have
+# canonical data to write, so a failed first fetch leaves no phantom entity.
+mkdir -p "$cache_dir"
+
+etag=$(manifest_get_field "$key" etag)
+hdr_file=$(mktemp); stderr_log=$(mktemp)
+trap 'rm -f "$hdr_file" "$stderr_log"' EXIT
+body_tmp="$cache_dir/last-payload.json.tmp"
+
+curl_args=(-sS -L --max-time 30 -D "$hdr_file" -w '%{http_code}' -o "$body_tmp"
+  -H "Accept: application/vnd.github+json" -H "User-Agent: databank-github/1")
+[ -n "${GITHUB_TOKEN:-}" ] && curl_args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+[ -n "$etag" ]            && curl_args+=(-H "If-None-Match: $etag")
+
+http_code=$(curl "${curl_args[@]}" "$api" 2>"$stderr_log") || {
+  err=$(tr '\n' ' ' <"$stderr_log" | head -c 300)
+  manifest_set_error "$key" "${err:-curl failed}"
+  log "fetch-releases: $repo FAILED (${err:-curl})"
+  rm -f "$body_tmp"
+  exit 1
+}
+
+now="$(now_iso)"
+new_etag=$(awk 'tolower($1)=="etag:"{$1=""; sub(/^ +/,""); print; exit}' "$hdr_file" | tr -d '\r')
+
+case "$http_code" in
+  304)
+    rm -f "$body_tmp"
+    local_count=0; [ -f "$releases_path" ] && local_count=$(jq 'length' "$releases_path")
+    log "fetch-releases: $repo 304 not modified (count=$local_count)"
+    manifest_set "$key" "$(jq -n --arg t "$now" --arg e "${new_etag:-$etag}" --argjson c "$local_count" \
+      '{last_fetched:$t, status:"ok", release_count:$c} + (if $e!="" then {etag:$e} else {} end)')"
+    exit 0 ;;
+  200) : ;;
+  403)
+    rm -f "$body_tmp"
+    manifest_set_error "$key" "HTTP 403 (rate limited? set GITHUB_TOKEN)"
+    log "fetch-releases: $repo FAILED (HTTP 403 — likely rate limit; set GITHUB_TOKEN)"
+    exit 1 ;;
+  *)
+    rm -f "$body_tmp"
+    manifest_set_error "$key" "HTTP $http_code"
+    log "fetch-releases: $repo FAILED (HTTP $http_code)"
+    exit 1 ;;
+esac
+
+# Keep the full raw payload (raw-cache escape hatch), then slim into canonical.
+mv "$body_tmp" "$cache_dir/last-payload.json"
+
+new_items=$(jq '
+  if type != "array" then [] else
+    map({
+      id:           (.id | tostring),
+      tag:          .tag_name,
+      name:         .name,
+      published_at: .published_at,
+      published_ts: ((.published_at // "" | fromdateiso8601?) // 0),
+      url:          .html_url,
+      prerelease:   .prerelease,
+      draft:        .draft,
+      body:         ((.body // "")[0:2000])
+    })
+  end' "$cache_dir/last-payload.json" 2>"$stderr_log") || {
+  err=$(tr '\n' ' ' <"$stderr_log" | head -c 300)
+  manifest_set_error "$key" "parse failed: ${err:-unknown}"
+  log "fetch-releases: $repo FAILED (parse: ${err:-unknown})"
+  exit 1
+}
+
+n_new=$(jq 'length' <<<"$new_items")
+prior_count=0; [ -f "$releases_path" ] && prior_count=$(jq 'length' "$releases_path")
+
+# Empty-guard: never clobber existing data with an empty result.
+if [ "$n_new" -eq 0 ] && [ "$prior_count" -gt 0 ]; then
+  log "fetch-releases: $repo returned 0 items but $prior_count on disk — NOT overwriting"
+  manifest_set "$key" "$(jq -n --arg t "$now" --arg e "${new_etag:-$etag}" --argjson c "$prior_count" \
+    '{last_fetched:$t, status:"empty", release_count:$c} + (if $e!="" then {etag:$e} else {} end)')"
+  exit 0
+fi
+
+# Cumulative upsert by id; newest first.
+existing='[]'; [ -f "$releases_path" ] && existing=$(cat "$releases_path")
+jq -n --argjson e "$existing" --argjson n "$new_items" '
+  ($e | map({(.id): .}) | add // {}) as $by
+  | ($n | map({(.id): .}) | add // {}) as $nb
+  | ($by + $nb) | to_entries | map(.value)
+  | sort_by(.published_ts) | reverse
+' | atomic_write "$releases_path"
+
+count=$(jq 'length' "$releases_path")
+manifest_set "$key" "$(jq -n --arg t "$now" --arg e "${new_etag:-$etag}" --argjson c "$count" \
+  '{last_fetched:$t, status:"ok", release_count:$c} + (if $e!="" then {etag:$e} else {} end)')"
+log "fetch-releases: $repo wrote $count releases (+$n_new fetched)"

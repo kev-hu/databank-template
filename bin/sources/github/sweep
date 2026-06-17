@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# sweep [--dry-run] — fetch every repo listed in config/github.yaml.
+#
+# Iterates the config, lets fetch-releases apply its own per-entity freshness
+# gate, and never lets one repo's failure abort the others. Exits nonzero if
+# any repo failed, so a scheduler can alert.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../../lib/common.sh"
+
+USAGE="usage: sweep github [--dry-run]"
+help_guard "$USAGE" "$@"
+
+dry_run=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry_run=1 ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+config="$DATABANK_CONFIG/github.yaml"
+[ -f "$config" ] || { echo "sweep: missing $config" >&2; exit 2; }
+
+mapfile -t repos < <(yq -r '.repos[]' "$config")
+[ "${#repos[@]}" -gt 0 ] || { log "sweep: no repos configured in $config"; exit 0; }
+
+n_ok=0 n_fail=0
+for repo in "${repos[@]}"; do
+  [ -n "$repo" ] || continue
+  if [ -n "$dry_run" ]; then
+    "$SCRIPT_DIR/fetch-releases" "$repo" --dry-run || true
+    continue
+  fi
+  if "$SCRIPT_DIR/fetch-releases" "$repo"; then
+    n_ok=$((n_ok + 1))
+  else
+    n_fail=$((n_fail + 1))
+    log "sweep: $repo failed (continuing)"
+  fi
+done
+
+log "sweep github: $n_ok ok, $n_fail failed (of ${#repos[@]})"
+[ "$n_fail" -eq 0 ]

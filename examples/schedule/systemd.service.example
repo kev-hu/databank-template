@@ -1,0 +1,14 @@
+# ~/.config/systemd/user/databank-github.service
+# Edit WorkingDirectory and the token, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now databank-github.timer
+[Unit]
+Description=databank sweep — github
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/databank
+Environment=GITHUB_TOKEN=ghp_xxx
+ExecStart=/path/to/databank/bin/databank sweep github
+StandardOutput=append:/path/to/databank/logs/sweep.log
+StandardError=append:/path/to/databank/logs/sweep.log

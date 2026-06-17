@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# get-releases <owner/repo|owner__repo> [--since 30d]
+#
+# Read the canonical releases.json back out as JSON. Read-only; never fetches.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/../../lib/common.sh"
+. "$DATABANK_LIB/duration.sh"
+
+USAGE="usage: get releases <owner/repo> [--since 30d]"
+help_guard "$USAGE" "$@"
+
+repo="" since=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) shift; since="${1:?--since requires a value}" ;;
+    --*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *) repo="$1" ;;
+  esac
+  shift
+done
+[ -n "$repo" ] || { echo "$USAGE" >&2; exit 2; }
+
+slug="${repo//\//__}"
+f="$DATABANK_DATA/github/$slug/releases.json"
+if [ ! -f "$f" ]; then
+  echo "no releases.json for $repo" >&2
+  echo "  (run 'databank list github' to see fetched repos)" >&2
+  exit 1
+fi
+
+if [ -z "$since" ]; then
+  cat "$f"
+  exit 0
+fi
+secs=$(parse_duration_seconds "$since") || exit 2
+cutoff=$(( $(date -u +%s) - secs ))
+jq --argjson c "$cutoff" '[.[] | select((.published_ts // 0) >= $c)]' "$f"

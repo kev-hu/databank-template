@@ -1,0 +1,11 @@
+# ~/.config/systemd/user/databank-github.timer
+# Pairs with databank-github.service. Runs every 6 hours.
+[Unit]
+Description=databank sweep timer — github
+
+[Timer]
+OnCalendar=*-*-* 0/6:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
