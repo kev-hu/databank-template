@@ -59,16 +59,17 @@ The repo ships one working source — `github` (release history) — that needs 
 
 ```bash
 # deps (macOS shown; bash 3.2+ already on macOS/Linux)
-brew install jq yq curl
-
-# put the CLI on your PATH (optional)
-ln -s "$PWD/bin/databank" ~/.local/bin/databank
+brew install jq yq curl               # yq must be v4 (mikefarah/Go), not the python yq
 
 # pull a repo's releases — no token required
-databank fetch github releases facebook/react
-databank get   github releases facebook/react | jq '.[0]'
-databank sweep github                 # refresh everything in config/github.yaml
-databank status                       # what's fresh, what failed, when
+bin/databank fetch github releases facebook/react
+bin/databank get   github releases facebook/react | jq '.[0]'
+bin/databank sweep github             # refresh everything in config/github.yaml
+bin/databank status                   # what's fresh, what failed, when
+
+# optional: symlink onto your PATH so you can drop the bin/ prefix and run
+# `databank …` from anywhere
+ln -s "$PWD/bin/databank" ~/.local/bin/databank
 ```
 
 A real run:
@@ -92,6 +93,8 @@ No issues.
 ```
 
 A second fetch within `max_age` is a no-op; after that it sends a conditional request, so an unchanged repo costs nothing. Set `GITHUB_TOKEN` to lift GitHub's rate limit.
+
+> **Using it from another project?** databank is a workspace you own, not a dependency — there's nothing to `import`. Consume it by calling the CLI (`databank get … | jq`) or reading the JSON files under `data/` by path.
 
 ## Build your own
 
