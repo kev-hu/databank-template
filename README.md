@@ -1,6 +1,6 @@
 <div align="center">
 
-# databank
+# 🗄️ databank
 
 ### Build your own data-acquisition layer — with help from your coding agent.
 
