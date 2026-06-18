@@ -43,13 +43,7 @@ Most scraping projects rot into a pile of one-off scripts that each store data d
 
 Three layers, one-way flow, with a frozen file contract as the only interface between them:
 
-```
-  SCRAPE  ─writes→  data/<source>/…                       canonical files
-              │
-  DERIVE  ─reads ┘ ─writes→  data/<source>/analysis/…     computed metrics
-              │
-  CONSUME ─reads ┘                                         tools · dashboards · agents (read-only)
-```
+<p align="center"><img alt="databank architecture: SCRAPE writes, DERIVE computes, CONSUME reads — all on one frozen file contract" src="./docs/assets/architecture.png" width="900"></p>
 
 Scrapers pull and normalize. Derive steps compute each metric once. Everything downstream only reads. Full reasoning in [`BRIEF.md`](./BRIEF.md).
 
